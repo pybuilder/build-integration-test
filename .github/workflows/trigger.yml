@@ -1,0 +1,126 @@
+name: Integration Test
+on:
+  workflow_dispatch:
+    inputs:
+      action-ref:
+        description: 'pybuilder/build SHA to test'
+        required: true
+      run-id:
+        description: 'Caller run ID for unique naming'
+        required: true
+
+permissions:
+  actions: read
+
+concurrency:
+  group: integration-test
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: integration-test/${{ inputs.run-id }}
+      TAG_PREFIX: itest-${{ inputs.run-id }}-v
+      GH_TOKEN: ${{ secrets.INTEGRATION_TEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.INTEGRATION_TEST_TOKEN }}
+
+      - name: Create test branch and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          echo 'version = "0.0.1.dev"' > build.py
+
+          mkdir -p .github/workflows
+          python3 -c "
+          import os, textwrap
+          content = textwrap.dedent('''
+            name: Release Test
+            on:
+              push:
+                branches: ['integration-test/**']
+            permissions:
+              contents: write
+            jobs:
+              release:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: pybuilder/build@{action_ref}
+                    with:
+                      python-version: '3.14'
+                      pyb-args: '--version'
+                      is-upload: 'true'
+                      auto-release: 'true'
+                      auto-github-release: 'true'
+                      auto-bump-dev: 'true'
+                      release-tag-prefix: '{tag_prefix}'
+          ''').strip() + '\n'
+          content = content.format(
+              action_ref=os.environ['ACTION_REF'],
+              tag_prefix=os.environ['TAG_PREFIX'],
+          )
+          with open('.github/workflows/release-test.yml', 'w') as f:
+              f.write(content)
+          "
+
+          git add -A
+          git commit -m "Integration test setup"
+
+          date > .trigger
+          git add .trigger
+          git commit -m "[release] Integration test"
+
+          git push -u origin "$BRANCH"
+        env:
+          ACTION_REF: ${{ inputs.action-ref }}
+
+      - name: Wait for release workflow
+        run: |
+          sleep 15
+          for i in $(seq 1 40); do
+            RUN_JSON=$(gh run list -b "$BRANCH" -w "Release Test" \
+              --json databaseId,status,conclusion -q '.[0]' 2>/dev/null || echo '{}')
+            STATUS=$(echo "$RUN_JSON" | jq -r '.status // empty')
+            if [ "$STATUS" = "completed" ]; then
+              CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion')
+              RUN_ID=$(echo "$RUN_JSON" | jq -r '.databaseId')
+              echo "Release workflow $RUN_ID completed: $CONCLUSION"
+              if [ "$CONCLUSION" != "success" ]; then
+                gh run view "$RUN_ID" --log-failed || true
+                exit 1
+              fi
+              break
+            fi
+            echo "Waiting... (attempt $i, status: ${STATUS:-pending})"
+            sleep 15
+          done
+          [ "$STATUS" = "completed" ] || { echo "Timed out"; exit 1; }
+
+      - name: Verify release artifacts
+        run: |
+          TAG="${TAG_PREFIX}0.0.1"
+          git fetch --all --tags
+
+          git tag -l | grep -q "^${TAG}$" \
+            || { echo "::error::Tag $TAG not found"; git tag -l; exit 1; }
+
+          gh release view "$TAG" --json tagName -q '.tagName' | grep -q "$TAG" \
+            || { echo "::error::GitHub release $TAG not found"; exit 1; }
+
+          git pull origin "$BRANCH"
+          grep -q '0\.0\.2\.dev' build.py \
+            || { echo "::error::Version not bumped to 0.0.2.dev"; cat build.py; exit 1; }
+
+          echo "All integration test verifications passed!"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          TAG="${TAG_PREFIX}0.0.1"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          git push origin --delete "$BRANCH" 2>/dev/null || true
